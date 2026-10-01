@@ -20,19 +20,40 @@ class InventoryLedger:
         self._lock = RLock()
 
     def post(self, account: str, reference: str, quantity, reason: str) -> Entry:
-        q = Decimal(str(quantity))
-        if not account or not reference or not reason:
-            raise ValueError("account, reference and reason required")
-        if q == 0:
-            raise ValueError("zero inventory entry")
-        key = (account, reference)
-        with self._lock:
-            if key in self._refs:
+        return self.post_many([(account, reference, quantity, reason)])[0]
+
+    def post_many(self, items: Iterable[tuple[str, str, object, str]]) -> tuple[Entry, ...]:
+        """Post several entries atomically.
+
+        Every item is validated (required fields, non-zero quantity, unique
+        idempotency reference within the batch and against existing rows)
+        before any row is appended, so a failed batch leaves the ledger
+        unchanged instead of half-posted.
+        """
+        prepared: list[tuple[str, str, Decimal, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for account, reference, quantity, reason in items:
+            q = Decimal(str(quantity))
+            if not account or not reference or not reason:
+                raise ValueError("account, reference and reason required")
+            if q == 0:
+                raise ValueError("zero inventory entry")
+            key = (account, reference)
+            if key in seen:
                 raise ValueError("duplicate idempotency reference")
-            row = Entry(len(self._rows) + 1, account, reference, q, reason)
-            self._rows.append(row)
-            self._refs.add(key)
-            return row
+            seen.add(key)
+            prepared.append((account, reference, q, reason))
+        with self._lock:
+            if any(key in self._refs for key in seen):
+                raise ValueError("duplicate idempotency reference")
+            base = len(self._rows)
+            entries = tuple(
+                Entry(base + i + 1, account, reference, q, reason)
+                for i, (account, reference, q, reason) in enumerate(prepared)
+            )
+            self._rows.extend(entries)
+            self._refs.update(seen)
+            return entries
 
     def reverse(self, sequence: int, reference: str, reason: str) -> Entry:
         with self._lock:
